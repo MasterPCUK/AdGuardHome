@@ -712,6 +712,9 @@ func (s *v6Server) Start(ctx context.Context) (err error) {
 	if !s.conf.Enabled {
 		return nil
 	}
+	if s.srv != nil {
+		return nil
+	}
 
 	ifaceName := s.conf.InterfaceName
 	iface, err := net.InterfaceByName(ifaceName)
@@ -729,7 +732,7 @@ func (s *v6Server) Start(ctx context.Context) (err error) {
 
 	if !ok {
 		// No available IP addresses which may appear later.
-		return nil
+		return errNoIfaceIPAddrs
 	}
 
 	// Don't initialize DHCPv6 server if we must force the clients to use SLAAC.

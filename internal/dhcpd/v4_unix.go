@@ -1306,6 +1306,9 @@ func (s *v4Server) Start(ctx context.Context) (err error) {
 	if !s.enabled() {
 		return nil
 	}
+	if s.srv != nil {
+		return nil
+	}
 
 	ifaceName := s.conf.InterfaceName
 	iface, err := net.InterfaceByName(ifaceName)
@@ -1328,8 +1331,8 @@ func (s *v4Server) Start(ctx context.Context) (err error) {
 	}
 
 	if len(dnsIPAddrs) == 0 {
-		// No available IP addresses which may appear later.
-		return nil
+		// No available IP addresses, which may appear later.
+		return errNoIfaceIPAddrs
 	}
 
 	s.configureDNSIPAddrs(dnsIPAddrs)

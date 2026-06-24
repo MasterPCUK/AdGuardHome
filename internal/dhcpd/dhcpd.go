@@ -3,10 +3,12 @@ package dhcpd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/dhcpsvc"
@@ -22,11 +24,22 @@ const (
 	DefaultDHCPTimeoutICMP = 1000
 )
 
-// Currently used defaults for ifaceDNSAddrs.
+// Currently used defaults for ifaceDNSAddrs.  The DHCP server has its own long
+// retry loop, so each individual attempt should only probe once.
 const (
-	defaultMaxAttempts int           = 10
+	defaultMaxAttempts int           = 1
 	defaultBackoff     time.Duration = 500 * time.Millisecond
 )
+
+// DHCP startup retry defaults.
+const (
+	defaultStartRetryInterval = 10 * time.Second
+	defaultStartRetryTimeout  = 10 * time.Minute
+)
+
+// errNoIfaceIPAddrs means that the interface doesn't have IP addresses suitable
+// for running the DHCP server yet.
+var errNoIfaceIPAddrs = errors.New("no interface ip addresses")
 
 // OnLeaseChangedT is a callback for lease changes.
 type OnLeaseChangedT func(flags int)
@@ -92,6 +105,12 @@ type server struct {
 	srv4 DHCPServer
 	srv6 DHCPServer
 
+	startMu           sync.Mutex
+	startRetryCancel  context.CancelFunc
+	startRetryDone    chan struct{}
+	startRetryIvl     time.Duration
+	startRetryTimeout time.Duration
+
 	// TODO(a.garipov): Either create a separate type for the internal config or
 	// just put the config values into Server.
 	conf *ServerConfig
@@ -107,6 +126,8 @@ var _ Interface = (*server)(nil)
 // families.  It also registers the corresponding HTTP API endpoints.
 func Create(ctx context.Context, conf *ServerConfig) (s *server, err error) {
 	s = &server{
+		startRetryIvl:     defaultStartRetryInterval,
+		startRetryTimeout: defaultStartRetryTimeout,
 		conf: &ServerConfig{
 			Logger:             conf.Logger,
 			CommandConstructor: conf.CommandConstructor,
@@ -247,23 +268,139 @@ func (s *server) WriteDiskConfig(c *ServerConfig) {
 	s.srv6.WriteDiskConfig6(&c.Conf6)
 }
 
-// Start will listen on port 67 and serve DHCP requests.
+// Start will listen on DHCP ports and serve DHCP requests.  If the network isn't
+// ready yet, it keeps retrying in the background for a limited time.
 func (s *server) Start(ctx context.Context) (err error) {
-	err = s.srv4.Start(ctx)
-	if err != nil {
-		return err
+	s.startMu.Lock()
+	if s.startRetryCancel != nil {
+		s.startMu.Unlock()
+
+		return nil
 	}
 
-	err = s.srv6.Start(ctx)
+	retryCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	done := make(chan struct{})
+	s.startRetryCancel = cancel
+	s.startRetryDone = done
+	s.startMu.Unlock()
+
+	err = s.startOnce(ctx)
 	if err != nil {
-		return err
+		s.conf.Logger.WarnContext(
+			ctx,
+			"starting dhcp server failed; retrying",
+			slogutil.KeyError,
+			err,
+			"interval",
+			s.startRetryInterval(),
+			"timeout",
+			s.startRetryLimit(),
+		)
+
+		go s.retryStart(retryCtx, done)
+
+		return nil
 	}
+
+	s.finishStartRetry(done)
 
 	return nil
 }
 
+// startOnce tries to start all configured DHCP servers once.
+func (s *server) startOnce(ctx context.Context) (err error) {
+	var errs []error
+	err = s.srv4.Start(ctx)
+	if err != nil {
+		errs = append(errs, err)
+	}
+
+	err = s.srv6.Start(ctx)
+	if err != nil {
+		errs = append(errs, err)
+	}
+
+	return errors.Join(errs...)
+}
+
+// retryStart retries DHCP startup until it succeeds, times out, or is stopped.
+func (s *server) retryStart(ctx context.Context, done chan struct{}) {
+	defer s.finishStartRetry(done)
+
+	ticker := time.NewTicker(s.startRetryInterval())
+	defer ticker.Stop()
+
+	timer := time.NewTimer(s.startRetryLimit())
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			s.conf.Logger.ErrorContext(ctx, "starting dhcp server timed out")
+
+			return
+		case <-ticker.C:
+			err := s.startOnce(ctx)
+			if err == nil {
+				s.conf.Logger.InfoContext(ctx, "dhcp server started")
+
+				return
+			}
+
+			s.conf.Logger.WarnContext(ctx, "starting dhcp server failed; retrying", slogutil.KeyError, err)
+		}
+	}
+}
+
+func (s *server) startRetryInterval() (ivl time.Duration) {
+	if s.startRetryIvl > 0 {
+		return s.startRetryIvl
+	}
+
+	return defaultStartRetryInterval
+}
+
+func (s *server) startRetryLimit() (timeout time.Duration) {
+	if s.startRetryTimeout > 0 {
+		return s.startRetryTimeout
+	}
+
+	return defaultStartRetryTimeout
+}
+
+func (s *server) finishStartRetry(done chan struct{}) {
+	s.startMu.Lock()
+	if s.startRetryDone == done {
+		s.startRetryCancel()
+		s.startRetryCancel = nil
+		s.startRetryDone = nil
+	}
+	s.startMu.Unlock()
+
+	close(done)
+}
+
+func (s *server) stopStartRetry() {
+	s.startMu.Lock()
+	cancel, done := s.startRetryCancel, s.startRetryDone
+	s.startRetryCancel = nil
+	s.startRetryDone = nil
+	s.startMu.Unlock()
+
+	if cancel == nil {
+		return
+	}
+
+	cancel()
+	<-done
+}
+
 // Stop closes the listening UDP socket
 func (s *server) Stop() (err error) {
+	s.stopStartRetry()
+
 	err = s.srv4.Stop()
 	if err != nil {
 		return err
