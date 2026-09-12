@@ -8,7 +8,6 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
-	"slices"
 	"sync"
 	"time"
 
@@ -16,6 +15,7 @@ import (
 	"github.com/AdguardTeam/AdGuardHome/internal/aghalg"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghos"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghtls"
+	"github.com/AdguardTeam/AdGuardHome/internal/configmgr"
 	"github.com/AdguardTeam/AdGuardHome/internal/configmigrate"
 	"github.com/AdguardTeam/AdGuardHome/internal/dhcpd"
 	"github.com/AdguardTeam/AdGuardHome/internal/dnsforward"
@@ -29,7 +29,6 @@ import (
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/netutil"
 	"github.com/AdguardTeam/golibs/timeutil"
-	"github.com/google/go-cmp/cmp"
 	"github.com/google/renameio/v2/maybe"
 	yaml "go.yaml.in/yaml/v4"
 )
@@ -43,39 +42,6 @@ const (
 	// FS-based rule lists.
 	userFilterDataDir = "userfilters"
 )
-
-// logSettings are the logging settings part of the configuration file.
-type logSettings struct {
-	// Enabled indicates whether logging is enabled.
-	Enabled bool `yaml:"enabled"`
-
-	// File is the path to the log file.  If empty, logs are written to stdout.
-	// If "syslog", logs are written to syslog.
-	File string `yaml:"file"`
-
-	// MaxBackups is the maximum number of old log files to retain.
-	//
-	// NOTE: MaxAge may still cause them to get deleted.
-	MaxBackups int `yaml:"max_backups"`
-
-	// MaxSize is the maximum size of the log file before it gets rotated, in
-	// megabytes.  The default value is 100 MB.
-	MaxSize int `yaml:"max_size"`
-
-	// MaxAge is the maximum duration for retaining old log files, in days.
-	MaxAge int `yaml:"max_age"`
-
-	// Compress determines, if the rotated log files should be compressed using
-	// gzip.
-	Compress bool `yaml:"compress"`
-
-	// LocalTime determines, if the time used for formatting the timestamps in
-	// is the computer's local time.
-	LocalTime bool `yaml:"local_time"`
-
-	// Verbose determines, if verbose (aka debug) logging is enabled.
-	Verbose bool `yaml:"verbose"`
-}
 
 // osConfig contains OS-related configuration.
 type osConfig struct {
@@ -111,6 +77,8 @@ type clientSourcesConfig struct {
 //
 // Field ordering is important, YAML fields better not to be reordered, if it's
 // not absolutely necessary.
+//
+// TODO(d.kolyshev):  Use [configmgr.Config].
 type configuration struct {
 	// Raw file data to avoid re-reading of configuration file
 	// It's reset after config is parsed
@@ -160,7 +128,7 @@ type configuration struct {
 	Clients *clientsConfig `yaml:"clients"`
 
 	// Log is a block with log configuration settings.
-	Log logSettings `yaml:"log"`
+	Log *configmgr.LogConfig `yaml:"log"`
 
 	OSConfig *osConfig `yaml:"os"`
 
@@ -298,8 +266,8 @@ type pendingRequests struct {
 }
 
 // tlsConfigSettings is the TLS configuration for DNS-over-TLS, DNS-over-QUIC,
-// and HTTPS.  When adding new properties, update the [tlsConfigSettings.clone]
-// and [tlsConfigSettings.setPrivateFieldsAndCompare] methods as necessary.
+// and HTTPS.  When adding new properties, update the conversion functions
+// [confFromTLSSettings] and [confToTLSSettings] as necessary.
 type tlsConfigSettings struct {
 	// Status is the current status of the configuration.
 	Status tlsConfigStatus `yaml:"-" json:"-"`
@@ -366,44 +334,6 @@ type tlsConfigSettings struct {
 
 	// ServePlainDNS defines whether to serve a plain DNS.
 	ServePlainDNS bool `yaml:"-" json:"-"`
-}
-
-// clone returns a deep copy of c.
-func (c *tlsConfigSettings) clone() (clone *tlsConfigSettings) {
-	clone = &tlsConfigSettings{}
-	*clone = *c
-
-	clone.OverrideTLSCiphers = slices.Clone(c.OverrideTLSCiphers)
-	clone.CertificateChainData = slices.Clone(c.CertificateChainData)
-	clone.PrivateKeyData = slices.Clone(c.PrivateKeyData)
-
-	clone.Status.DNSNames = slices.Clone(c.Status.DNSNames)
-
-	return clone
-}
-
-// setPrivateFieldsAndCompare sets any missing properties in conf to match those
-// in c and returns true if TLS configurations are equal.  conf must not be nil.
-// It sets the following properties because these are not accepted from the
-// frontend:
-//
-//	[tlsConfigSettings.DNSCryptConfigFile]
-//	[tlsConfigSettings.OverrideTLSCiphers]
-//	[tlsConfigSettings.PortDNSCrypt]
-//
-// The following properties are skipped as they are set by
-// [tlsManager.loadTLSConfig]:
-//
-//	[tlsConfigSettings.CertificateChainData]
-//	[tlsConfigSettings.PrivateKeyData]
-func (c *tlsConfigSettings) setPrivateFieldsAndCompare(conf *tlsConfigSettings) (equal bool) {
-	conf.OverrideTLSCiphers = slices.Clone(c.OverrideTLSCiphers)
-
-	conf.DNSCryptConfigFile = c.DNSCryptConfigFile
-	conf.PortDNSCrypt = c.PortDNSCrypt
-
-	// TODO(a.garipov): Define a custom comparer.
-	return cmp.Equal(c, conf)
 }
 
 type queryLogConfig struct {
@@ -615,16 +545,6 @@ var config = &configuration{
 			DHCP:      true,
 			HostsFile: true,
 		},
-	},
-	Log: logSettings{
-		Enabled:    true,
-		File:       "",
-		MaxBackups: 0,
-		MaxSize:    100,
-		MaxAge:     3,
-		Compress:   false,
-		LocalTime:  false,
-		Verbose:    false,
 	},
 	OSConfig:      &osConfig{},
 	SchemaVersion: configmigrate.LastSchemaVersion,
@@ -880,7 +800,7 @@ func readConfigFile(
 func (c *configuration) write(
 	ctx context.Context,
 	l *slog.Logger,
-	tlsMgr *tlsManager,
+	extTLSConf *aghtls.ExtendedTLSConfig,
 	auth *auth,
 	workDir string,
 	confPath string,
@@ -892,9 +812,8 @@ func (c *configuration) write(
 		config.Users = auth.usersList(ctx)
 	}
 
-	if tlsMgr != nil {
-		extTLSConf := tlsMgr.extendedTLSConfig()
-		config.TLS = *extTLSConf
+	if extTLSConf != nil {
+		config.TLS = confToTLSSettings(extTLSConf)
 	}
 
 	if globalContext.stats != nil {
@@ -985,7 +904,7 @@ type defaultConfigModifier struct {
 	auth     *auth
 	config   *configuration
 	logger   *slog.Logger
-	tlsMgr   *tlsManager
+	tlsMgr   aghtls.Manager
 	workDir  string
 	confPath string
 }
@@ -1014,7 +933,12 @@ var _ agh.ConfigModifier = (*defaultConfigModifier)(nil)
 // Apply implements the [agh.ConfigModifier] interface for
 // *defaultConfigModifier.
 func (cm *defaultConfigModifier) Apply(ctx context.Context) {
-	err := cm.config.write(ctx, cm.logger, cm.tlsMgr, cm.auth, cm.workDir, cm.confPath)
+	var extTLSConf *aghtls.ExtendedTLSConfig
+	if cm.tlsMgr != nil {
+		extTLSConf = cm.tlsMgr.ExtendedTLSConfig()
+	}
+
+	err := cm.config.write(ctx, cm.logger, extTLSConf, cm.auth, cm.workDir, cm.confPath)
 	if err != nil {
 		cm.logger.ErrorContext(ctx, "writing config", slogutil.KeyError, err)
 	}
@@ -1026,6 +950,6 @@ func (cm *defaultConfigModifier) setAuth(a *auth) {
 }
 
 // setTLSManager sets the TLS manager used by Apply.
-func (cm *defaultConfigModifier) setTLSManager(m *tlsManager) {
+func (cm *defaultConfigModifier) setTLSManager(m aghtls.Manager) {
 	cm.tlsMgr = m
 }
